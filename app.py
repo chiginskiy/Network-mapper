@@ -4,10 +4,19 @@ import ipaddress
 import json
 import subprocess
 import platform
+import ctypes
 from flask import Flask, jsonify, render_template_string, Response
 import nmap
 
 app = Flask(__name__)
+
+def is_admin():
+    """Проверка, запущен ли процесс с правами администратора (Windows)"""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        # На Linux/macOS можно проверить через os.geteuid() == 0
+        return False
 
 def get_default_gateway():
     """Возвращает IP шлюза по умолчанию (кроссплатформенно)"""
@@ -88,111 +97,118 @@ def scan_stream():
     def generate():
         yield "data: {}\n\n".format(json.dumps({'type': 'start', 'message': 'Начинаем сканирование...'}))
 
+        # Проверяем права администратора
+        admin = is_admin()
+        if not admin:
+            yield "data: {}\n\n".format(json.dumps({
+                'type': 'warning',
+                'message': '⚠️ Внимание: скрипт запущен без прав администратора. Некоторые MAC-адреса могут быть недоступны, сканирование может быть неполным.'
+            }))
+
+        # Проверка наличия nmap
         try:
-            # Проверка nmap
-            try:
-                nmap.nmap.PortScanner().__class__
-            except Exception:
-                yield "data: {}\n\n".format(json.dumps({'type': 'error', 'message': 'nmap не найден. Установите nmap и добавьте в PATH'}))
-                return
+            nmap.nmap.PortScanner().__class__
+        except Exception:
+            yield "data: {}\n\n".format(json.dumps({'type': 'error', 'message': 'nmap не найден. Установите nmap и добавьте в PATH'}))
+            return
 
-            networks, local_ips = get_all_networks()
-            if not networks:
-                yield "data: {}\n\n".format(json.dumps({'type': 'error', 'message': 'Нет активных сетей (кроме localhost)'}))
-                return
+        networks, local_ips = get_all_networks()
+        if not networks:
+            yield "data: {}\n\n".format(json.dumps({'type': 'error', 'message': 'Нет активных сетей (кроме localhost)'}))
+            return
 
-            total_networks = len(networks)
-            yield "data: {}\n\n".format(json.dumps({'type': 'log', 'message': f'Найдено подсетей: {total_networks}'}))
+        total_networks = len(networks)
+        yield "data: {}\n\n".format(json.dumps({'type': 'log', 'message': f'Найдено подсетей: {total_networks}'}))
 
-            all_devices = []
-            gateway_ips = [net['gateway'] for net in networks]
-            nm = nmap.PortScanner()
+        all_devices = []
+        gateway_ips = [net['gateway'] for net in networks]
+        nm = nmap.PortScanner()
 
-            for idx, net in enumerate(networks, 1):
-                yield "data: {}\n\n".format(json.dumps({
-                    'type': 'log',
-                    'message': f'🔍 Сканирую подсеть {net["subnet"]} (шлюз {net["gateway"]})...'
-                }))
+        for idx, net in enumerate(networks, 1):
+            yield "data: {}\n\n".format(json.dumps({
+                'type': 'log',
+                'message': f'🔍 Сканирую подсеть {net["subnet"]} (шлюз {net["gateway"]})...'
+            }))
 
-                nm.scan(
-                    hosts=net['subnet'],
-                    arguments='-sn -R -T4 --host-timeout 10s'
-                )
+            nm.scan(
+                hosts=net['subnet'],
+                arguments='-sn -R -T4 --host-timeout 10s'
+            )
 
-                devices_in_subnet = []
-                for host in nm.all_hosts():
-                    if nm[host].state() != 'up':
-                        continue
-
-                    hostname = nm[host].hostname() or 'Неизвестно'
-                    mac = nm[host]['addresses'].get('mac', 'N/A')
-                    vendor = nm[host].get('vendor', {}).get(mac, 'Неизвестно') if mac != 'N/A' else 'Неизвестно'
-
-                    if hostname == 'Неизвестно':
-                        try:
-                            hostname = socket.gethostbyaddr(host)[0]
-                        except:
-                            pass
-
-                    dev_type = guess_device_type(hostname, vendor, host, gateway_ips)
-
-                    dev = {
-                        'ip': host,
-                        'hostname': hostname,
-                        'mac': mac,
-                        'vendor': vendor,
-                        'type': dev_type,
-                        'subnet': net['subnet']
-                    }
-                    devices_in_subnet.append(dev)
-                    all_devices.append(dev)
-
-                progress = int((idx / total_networks) * 100)
-                yield "data: {}\n\n".format(json.dumps({
-                    'type': 'progress',
-                    'percent': progress,
-                    'message': f'✅ Подсеть {idx}/{total_networks} обработана, найдено {len(devices_in_subnet)} устройств'
-                }))
-
-            # Добавляем локальный компьютер
-            this_pc_name = socket.gethostname()
-            for lip in local_ips:
-                if any(d['ip'] == lip for d in all_devices):
+            devices_in_subnet = []
+            for host in nm.all_hosts():
+                if nm[host].state() != 'up':
                     continue
-                local_mac = 'N/A'
-                try:
-                    for iface, addrs in psutil.net_if_addrs().items():
-                        for addr in addrs:
-                            if addr.address == lip and addr.family == psutil.AF_LINK:
-                                local_mac = addr.address
-                                break
-                except:
-                    pass
-                all_devices.append({
-                    'ip': lip,
-                    'hostname': this_pc_name,
-                    'mac': local_mac,
-                    'vendor': 'Локальный компьютер',
-                    'type': '💻 Этот компьютер',
-                    'subnet': 'Local'
-                })
 
-            # Убираем дубли, сортируем
-            unique = {d['ip']: d for d in all_devices if d['ip'] not in ['127.0.0.1', '::1']}
-            sorted_devices = sorted(unique.values(), key=lambda x: tuple(map(int, x['ip'].split('.'))))
+                hostname = nm[host].hostname() or 'Неизвестно'
+                mac = nm[host]['addresses'].get('mac', 'N/A')
+                vendor = nm[host].get('vendor', {}).get(mac, 'Неизвестно') if mac != 'N/A' else 'Неизвестно'
 
+                if hostname == 'Неизвестно':
+                    try:
+                        hostname = socket.gethostbyaddr(host)[0]
+                    except:
+                        pass
+
+                dev_type = guess_device_type(hostname, vendor, host, gateway_ips)
+
+                dev = {
+                    'ip': host,
+                    'hostname': hostname,
+                    'mac': mac,
+                    'vendor': vendor,
+                    'type': dev_type,
+                    'subnet': net['subnet']
+                }
+                devices_in_subnet.append(dev)
+                all_devices.append(dev)
+
+            progress = int((idx / total_networks) * 100)
             yield "data: {}\n\n".format(json.dumps({
-                'type': 'result',
-                'devices': sorted_devices,
-                'networks': networks
+                'type': 'progress',
+                'percent': progress,
+                'message': f'✅ Подсеть {idx}/{total_networks} обработана, найдено {len(devices_in_subnet)} устройств'
             }))
 
-        except Exception as e:
-            import traceback
-            yield "data: {}\n\n".format(json.dumps({
-                'type': 'error',
-                'message': str(e) + '\n' + traceback.format_exc()
-            }))
+        # Добавляем локальный компьютер
+        this_pc_name = socket.gethostname()
+        for lip in local_ips:
+            if any(d['ip'] == lip for d in all_devices):
+                continue
+            local_mac = 'N/A'
+            try:
+                for iface, addrs in psutil.net_if_addrs().items():
+                    for addr in addrs:
+                        if addr.address == lip and addr.family == psutil.AF_LINK:
+                            local_mac = addr.address
+                            break
+            except:
+                pass
+            all_devices.append({
+                'ip': lip,
+                'hostname': this_pc_name,
+                'mac': local_mac,
+                'vendor': 'Локальный компьютер',
+                'type': '💻 Этот компьютер',
+                'subnet': 'Local'
+            })
+
+        # Убираем дубли, сортируем
+        unique = {d['ip']: d for d in all_devices if d['ip'] not in ['127.0.0.1', '::1']}
+        sorted_devices = sorted(unique.values(), key=lambda x: tuple(map(int, x['ip'].split('.'))))
+
+        # Формируем заметку о правах
+        note = "Имена из DHCP + socket.gethostbyaddr."
+        if not admin:
+            note += " ⚠️ Запустите от имени администратора для полного сканирования (MAC-адреса и точные данные)."
+
+        yield "data: {}\n\n".format(json.dumps({
+            'type': 'result',
+            'devices': sorted_devices,
+            'networks': networks,
+            'admin': admin,
+            'note': note
+        }))
 
     return Response(generate(), mimetype='text/event-stream')
 
@@ -201,7 +217,7 @@ HTML_TEMPLATE = """
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <title>Карта локальной сети v7.1</title>
+    <title>Карта локальной сети v7.2</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <script src="https://unpkg.com/vis-network@9.1.2/standalone/umd/vis-network.min.js"></script>
     <style>
@@ -213,7 +229,7 @@ HTML_TEMPLATE = """
 </head>
 <body class="p-4">
 <div class="container">
-    <h1 class="mb-4 text-center">🗺️ Карта локальной сети v7.1 (с прогрессом)</h1>
+    <h1 class="mb-4 text-center">🗺️ Карта локальной сети v7.2 (с проверкой прав)</h1>
     <div id="info" class="alert alert-info">Нажмите кнопку для сканирования</div>
     <button id="scan-btn" class="btn btn-success btn-lg w-100 mb-3">🚀 СКАНИРОВАТЬ СЕТЬ</button>
 
@@ -290,6 +306,11 @@ document.getElementById('scan-btn').addEventListener('click', async () => {
             case 'start':
                 addLog('🚀 ' + data.message);
                 break;
+            case 'warning':
+                addLog('⚠️ ' + data.message);
+                info.className = 'alert alert-warning';
+                info.innerHTML = data.message;
+                break;
             case 'log':
                 addLog('📌 ' + data.message);
                 break;
@@ -320,7 +341,6 @@ document.getElementById('scan-btn').addEventListener('click', async () => {
 
     eventSource.onerror = function() {
         addLog('⚠️ Соединение потеряно или закрыто');
-        // Не закрываем автоматически, возможно переподключение
     };
 });
 
@@ -345,7 +365,7 @@ function renderResult(data) {
     info.className = 'alert alert-success';
     info.innerHTML = `Найдено сетей: <strong>${data.networks.length}</strong><br>` +
                      `Устройств: <strong>${data.devices.length}</strong><br>` +
-                     `<small>Имена из DHCP + socket.gethostbyaddr. Запускай от имени администратора!</small>`;
+                     `<small>${data.note || ''}</small>`;
 
     // Строим граф
     const nodes = new vis.DataSet();
@@ -422,6 +442,9 @@ function renderResult(data) {
 
 if __name__ == '__main__':
     print("🚀 Запуск сервера...")
+    if not is_admin():
+        print("⚠️  ВНИМАНИЕ: Запустите PowerShell/терминал ОТ ИМЕНИ АДМИНИСТРАТОРА для полной функциональности!")
+    else:
+        print("✅ Права администратора есть, сканирование будет работать полностью.")
     print("Открой: http://127.0.0.1:5000")
-    print("ВАЖНО: Запусти PowerShell/терминал ОТ ИМЕНИ АДМИНИСТРАТОРА!")
     app.run(debug=True, threaded=True)
