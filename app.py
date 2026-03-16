@@ -1,450 +1,937 @@
+import os
+import re
+import json
+import time
 import socket
 import psutil
 import ipaddress
-import json
 import subprocess
 import platform
 import ctypes
-from flask import Flask, jsonify, render_template_string, Response
+from typing import Dict, List, Optional, Tuple
+
+from flask import Flask, Response, render_template_string, stream_with_context
 import nmap
 
 app = Flask(__name__)
 
-def is_admin():
-    """Проверка, запущен ли процесс с правами администратора (Windows)"""
+MAX_HOSTS_PER_SUBNET = 4096
+NMAP_SCAN_ARGUMENTS = "-sn -R -T4 --host-timeout 10s"
+IGNORED_IFACE_PARTS = ("docker", "vboxnet", "vmnet", "br-", "loopback", "lo")
+
+
+def is_admin() -> bool:
+    """Проверка повышенных привилегий."""
+    system = platform.system()
     try:
-        return ctypes.windll.shell32.IsUserAnAdmin()
-    except:
-        # На Linux/macOS можно проверить через os.geteuid() == 0
+        if system == "Windows":
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        return os.geteuid() == 0
+    except Exception:
         return False
 
-def get_default_gateway():
-    """Возвращает IP шлюза по умолчанию (кроссплатформенно)"""
+
+def safe_run_command(command: str) -> str:
+    """Безопасный запуск shell-команды с возвратом текста."""
+    return subprocess.check_output(
+        command,
+        shell=True,
+        text=True,
+        stderr=subprocess.DEVNULL,
+        encoding="utf-8",
+        errors="ignore",
+    ).strip()
+
+
+def get_default_gateway() -> Optional[str]:
+    """
+    Возвращает IP шлюза по умолчанию.
+    Это лучший-effort: если не удалось определить, возвращает None.
+    """
+    system = platform.system()
+
     try:
-        if platform.system() == 'Windows':
-            output = subprocess.check_output('route print -4', shell=True, text=True)
+        if system == "Windows":
+            output = safe_run_command("route print -4")
+
+            # Ищем строку таблицы маршрутизации с default route:
+            # 0.0.0.0    0.0.0.0    <gateway>    ...
             for line in output.splitlines():
-                if '0.0.0.0' in line and 'On-link' not in line:
+                line = line.strip()
+                if not line or "On-link" in line:
+                    continue
+                if re.match(r"^0\.0\.0\.0\s+0\.0\.0\.0\s+\d+\.\d+\.\d+\.\d+", line):
                     parts = line.split()
-                    if len(parts) >= 3 and parts[2] != 'On-link':
-                        return parts[2]
-        else:  # Linux / Mac
-            output = subprocess.check_output('ip route | grep default', shell=True, text=True)
-            return output.split()[2]
-    except:
-        return None
+                    if len(parts) >= 3:
+                        gateway = parts[2]
+                        try:
+                            ipaddress.ip_address(gateway)
+                            return gateway
+                        except ValueError:
+                            continue
 
-def get_all_networks():
-    networks = []
-    local_ips = []
-    seen = set()
-    ignore_ifaces = ('docker', 'vboxnet', 'vmnet', 'br-', 'lo')
-    for iface, addrs in psutil.net_if_addrs().items():
-        if any(ign in iface.lower() for ign in ignore_ifaces):
-            continue
-        stats = psutil.net_if_stats().get(iface)
-        if stats and stats.isup:
+        elif system == "Linux":
+            commands = [
+                "ip route show default",
+                "route -n",
+            ]
+            for cmd in commands:
+                try:
+                    output = safe_run_command(cmd)
+                except Exception:
+                    continue
+
+                for line in output.splitlines():
+                    line = line.strip()
+                    if line.startswith("default via "):
+                        parts = line.split()
+                        if len(parts) >= 3:
+                            gateway = parts[2]
+                            try:
+                                ipaddress.ip_address(gateway)
+                                return gateway
+                            except ValueError:
+                                pass
+
+                    # fallback для route -n
+                    if re.match(r"^0\.0\.0\.0\s+\d+\.\d+\.\d+\.\d+", line):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            gateway = parts[1]
+                            try:
+                                ipaddress.ip_address(gateway)
+                                return gateway
+                            except ValueError:
+                                pass
+
+        elif system == "Darwin":
+            commands = [
+                "route -n get default",
+                "netstat -rn",
+            ]
+            for cmd in commands:
+                try:
+                    output = safe_run_command(cmd)
+                except Exception:
+                    continue
+
+                for line in output.splitlines():
+                    line = line.strip()
+
+                    # route -n get default -> gateway: 192.168.1.1
+                    if line.lower().startswith("gateway:"):
+                        gateway = line.split(":", 1)[1].strip()
+                        try:
+                            ipaddress.ip_address(gateway)
+                            return gateway
+                        except ValueError:
+                            pass
+
+                    # netstat -rn -> default 192.168.1.1 ...
+                    if line.startswith("default "):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            gateway = parts[1]
+                            try:
+                                ipaddress.ip_address(gateway)
+                                return gateway
+                            except ValueError:
+                                pass
+
+    except Exception:
+        pass
+
+    return None
+
+
+def get_nmap_scanner() -> nmap.PortScanner:
+    """
+    Проверяет доступность nmap и возвращает инициализированный сканер.
+    Бросает RuntimeError, если nmap недоступен.
+    """
+    try:
+        nm = nmap.PortScanner()
+        _ = nm.nmap_version()
+        return nm
+    except Exception as exc:
+        raise RuntimeError(
+            "nmap не найден или недоступен. Установите nmap и добавьте его в PATH."
+        ) from exc
+
+
+def is_ignored_interface(iface_name: str) -> bool:
+    lowered = iface_name.lower()
+    return any(part in lowered for part in IGNORED_IFACE_PARTS)
+
+
+def get_mac_for_ip(target_ip: str) -> str:
+    """
+    Возвращает MAC интерфейса, на котором висит target_ip.
+    """
+    try:
+        for iface, addrs in psutil.net_if_addrs().items():
+            has_target_ip = any(
+                addr.family == socket.AF_INET and addr.address == target_ip
+                for addr in addrs
+            )
+            if not has_target_ip:
+                continue
+
             for addr in addrs:
-                if addr.family == socket.AF_INET and not addr.address.startswith(('127.', '169.254.')):
-                    if not addr.netmask:
-                        continue
-                    try:
-                        net = ipaddress.ip_network(f"{addr.address}/{addr.netmask}", strict=False)
-                        subnet_str = str(net)
-                        if subnet_str not in seen:
-                            seen.add(subnet_str)
-                            gw = get_default_gateway()
-                            if not gw or ipaddress.ip_address(gw) not in net:
-                                gw = str(net.network_address + 1)
-                            networks.append({'subnet': subnet_str, 'gateway': gw})
-                            local_ips.append(addr.address)
-                    except Exception:
-                        pass
-    return networks, list(set(local_ips))
+                # Windows/Linux/macOS могут давать AF_LINK по-разному
+                if getattr(psutil, "AF_LINK", None) is not None and addr.family == psutil.AF_LINK:
+                    return addr.address or "N/A"
 
-def guess_device_type(hostname, vendor, ip, gateway_ips):
-    hn = (hostname or '').lower()
-    vm = (vendor or '').lower()
+                # Иногда MAC может приходить строкой в другом family — берем только похожие значения
+                if isinstance(addr.address, str) and re.match(
+                    r"^[0-9a-fA-F]{2}([:-][0-9a-fA-F]{2}){5}$", addr.address
+                ):
+                    return addr.address
+    except Exception:
+        pass
+    return "N/A"
+
+
+def resolve_hostname(ip: str, primary: Optional[str] = None) -> str:
+    """
+    Возвращает hostname. Если primary уже осмысленный — использует его.
+    """
+    if primary and primary.strip() and primary.strip().lower() != "unknown":
+        return primary.strip()
+
+    try:
+        host, _, _ = socket.gethostbyaddr(ip)
+        if host:
+            return host
+    except Exception:
+        pass
+
+    return "Неизвестно"
+
+
+def get_all_networks() -> Tuple[List[Dict], List[str]]:
+    """
+    Возвращает список активных IPv4-подсетей и список локальных IPv4-адресов.
+    """
+    networks: List[Dict] = []
+    local_ips: List[str] = []
+    seen_subnets = set()
+
+    default_gw = get_default_gateway()
+
+    for iface, addrs in psutil.net_if_addrs().items():
+        if is_ignored_interface(iface):
+            continue
+
+        stats = psutil.net_if_stats().get(iface)
+        if not stats or not stats.isup:
+            continue
+
+        for addr in addrs:
+            if addr.family != socket.AF_INET:
+                continue
+            if not addr.address or addr.address.startswith(("127.", "169.254.")):
+                continue
+            if not addr.netmask:
+                continue
+
+            try:
+                net = ipaddress.ip_network(f"{addr.address}/{addr.netmask}", strict=False)
+            except Exception:
+                continue
+
+            subnet_str = str(net)
+            if subnet_str in seen_subnets:
+                if addr.address not in local_ips:
+                    local_ips.append(addr.address)
+                continue
+
+            seen_subnets.add(subnet_str)
+            if addr.address not in local_ips:
+                local_ips.append(addr.address)
+
+            gateway = None
+            gateway_guessed = False
+
+            if default_gw:
+                try:
+                    gw_ip = ipaddress.ip_address(default_gw)
+                    if gw_ip in net:
+                        gateway = default_gw
+                except ValueError:
+                    gateway = None
+
+            if gateway is None:
+                # Fallback — только как предположение
+                try:
+                    gateway = str(net.network_address + 1)
+                    gateway_guessed = True
+                except Exception:
+                    gateway = "Неизвестно"
+                    gateway_guessed = True
+
+            networks.append(
+                {
+                    "iface": iface,
+                    "subnet": subnet_str,
+                    "gateway": gateway,
+                    "gateway_guessed": gateway_guessed,
+                    "local_ip": addr.address,
+                }
+            )
+
+    return networks, sorted(set(local_ips), key=lambda ip: ipaddress.ip_address(ip))
+
+
+def guess_device(hostname: str, vendor: str, ip: str, gateway_ips: List[str]) -> Tuple[str, str]:
+    """
+    Возвращает (label, category)
+    category используется на фронтенде для цвета/стиля.
+    """
+    hn = (hostname or "").lower()
+    vd = (vendor or "").lower()
 
     if ip in gateway_ips:
-        return '🔌 Шлюз / Роутер'
+        return "🔌 Шлюз / роутер", "gateway"
 
-    if any(x in vm for x in ['tp-link', 'd-link', 'asus', 'mikrotik', 'cisco', 'router']):
-        return '🔌 Сетевое оборудование'
-    if any(x in vm for x in ['hp', 'brother', 'epson', 'canon', 'kyocera', 'xerox']):
-        return '🖨️ Принтер'
-    if any(x in hn for x in ['iphone', 'ipad', 'macbook', 'imac']):
-        return '🍎 Apple устройство'
-    if any(x in hn for x in ['yandex', 'alice', 'mini']):
-        return '🎙️ Яндекс.Станция'
-    if any(x in hn for x in ['sber', 'salute']):
-        return '📺 Sber устройство'
-    if 'tv' in hn or 'lg' in vm or 'samsung' in vm:
-        return '📺 Телевизор'
-    if 'pc' in hn or 'desktop' in hn or 'laptop' in hn:
-        return '💻 Компьютер/Ноутбук'
-    if 'phone' in hn or 'mobile' in hn:
-        return '📱 Телефон'
+    if any(x in vd for x in ["tp-link", "d-link", "asus", "mikrotik", "cisco", "ubiquiti", "huawei"]):
+        return "🔌 Сетевое оборудование", "network"
 
-    return '❓ Неизвестное устройство'
+    if any(x in vd for x in ["hp", "brother", "epson", "canon", "kyocera", "xerox", "lexmark"]):
+        return "🖨️ Принтер", "printer"
 
-@app.route('/')
+    if any(x in hn for x in ["iphone", "ipad", "macbook", "imac", "apple-tv"]):
+        return "🍎 Apple устройство", "apple"
+
+    if any(x in hn for x in ["yandex", "alice", "yndx", "станция", "station"]):
+        return "🎙️ Яндекс.Станция", "yandex"
+
+    if any(x in hn for x in ["sber", "salute", "салют"]):
+        return "📺 Sber устройство", "sber"
+
+    if "tv" in hn or any(x in vd for x in ["lg", "samsung", "sony", "philips", "tcl", "hisense"]):
+        return "📺 Телевизор / медиаприставка", "tv"
+
+    if any(x in hn for x in ["pc", "desktop", "laptop", "notebook"]) or any(
+        x in vd for x in ["lenovo", "dell", "asus", "acer", "msi", "intel"]
+    ):
+        return "💻 Компьютер / ноутбук", "computer"
+
+    if any(x in hn for x in ["phone", "mobile", "android"]):
+        return "📱 Телефон", "phone"
+
+    return "❓ Неизвестное устройство", "unknown"
+
+
+def sse_message(payload: Dict) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+@app.route("/")
 def index():
     return render_template_string(HTML_TEMPLATE)
 
-@app.route('/api/scan/stream')
-def scan_stream():
-    def generate():
-        yield "data: {}\n\n".format(json.dumps({'type': 'start', 'message': 'Начинаем сканирование...'}))
 
-        # Проверяем права администратора
+@app.route("/api/scan/stream")
+def scan_stream():
+    @stream_with_context
+    def generate():
+        start_time = time.time()
+        yield sse_message({"type": "start", "message": "Начинаем сканирование..."})
+
         admin = is_admin()
         if not admin:
-            yield "data: {}\n\n".format(json.dumps({
-                'type': 'warning',
-                'message': '⚠️ Внимание: скрипт запущен без прав администратора. Некоторые MAC-адреса могут быть недоступны, сканирование может быть неполным.'
-            }))
+            yield sse_message(
+                {
+                    "type": "warning",
+                    "message": (
+                        "Скрипт запущен без прав администратора. "
+                        "Некоторые MAC-адреса и данные устройств могут быть недоступны."
+                    ),
+                }
+            )
 
-        # Проверка наличия nmap
         try:
-            nmap.nmap.PortScanner().__class__
-        except Exception:
-            yield "data: {}\n\n".format(json.dumps({'type': 'error', 'message': 'nmap не найден. Установите nmap и добавьте в PATH'}))
+            nm = get_nmap_scanner()
+        except RuntimeError as exc:
+            yield sse_message({"type": "error", "message": str(exc)})
             return
 
         networks, local_ips = get_all_networks()
         if not networks:
-            yield "data: {}\n\n".format(json.dumps({'type': 'error', 'message': 'Нет активных сетей (кроме localhost)'}))
+            yield sse_message(
+                {
+                    "type": "error",
+                    "message": "Не найдено активных IPv4-сетей (кроме localhost/служебных интерфейсов).",
+                }
+            )
             return
 
-        total_networks = len(networks)
-        yield "data: {}\n\n".format(json.dumps({'type': 'log', 'message': f'Найдено подсетей: {total_networks}'}))
+        yield sse_message(
+            {
+                "type": "log",
+                "message": f"Найдено активных подсетей: {len(networks)}",
+            }
+        )
 
-        all_devices = []
-        gateway_ips = [net['gateway'] for net in networks]
-        nm = nmap.PortScanner()
+        scannable_networks = []
+        for net in networks:
+            try:
+                net_obj = ipaddress.ip_network(net["subnet"], strict=False)
+                host_count = max(0, net_obj.num_addresses - 2) if net_obj.version == 4 else net_obj.num_addresses
+                net["host_count"] = host_count
 
-        for idx, net in enumerate(networks, 1):
-            yield "data: {}\n\n".format(json.dumps({
-                'type': 'log',
-                'message': f'🔍 Сканирую подсеть {net["subnet"]} (шлюз {net["gateway"]})...'
-            }))
-
-            nm.scan(
-                hosts=net['subnet'],
-                arguments='-sn -R -T4 --host-timeout 10s'
-            )
-
-            devices_in_subnet = []
-            for host in nm.all_hosts():
-                if nm[host].state() != 'up':
+                if net_obj.num_addresses > MAX_HOSTS_PER_SUBNET:
+                    yield sse_message(
+                        {
+                            "type": "warning",
+                            "message": (
+                                f"Подсеть {net['subnet']} слишком большая "
+                                f"({net_obj.num_addresses} адресов) — пропускаю."
+                            ),
+                        }
+                    )
                     continue
 
-                hostname = nm[host].hostname() or 'Неизвестно'
-                mac = nm[host]['addresses'].get('mac', 'N/A')
-                vendor = nm[host].get('vendor', {}).get(mac, 'Неизвестно') if mac != 'N/A' else 'Неизвестно'
+                scannable_networks.append(net)
+            except Exception:
+                yield sse_message(
+                    {
+                        "type": "warning",
+                        "message": f"Не удалось обработать подсеть {net.get('subnet', '<?>')}, пропускаю.",
+                    }
+                )
 
-                if hostname == 'Неизвестно':
-                    try:
-                        hostname = socket.gethostbyaddr(host)[0]
-                    except:
-                        pass
-
-                dev_type = guess_device_type(hostname, vendor, host, gateway_ips)
-
-                dev = {
-                    'ip': host,
-                    'hostname': hostname,
-                    'mac': mac,
-                    'vendor': vendor,
-                    'type': dev_type,
-                    'subnet': net['subnet']
+        if not scannable_networks:
+            yield sse_message(
+                {
+                    "type": "error",
+                    "message": "Нет подходящих подсетей для сканирования.",
                 }
-                devices_in_subnet.append(dev)
-                all_devices.append(dev)
+            )
+            return
+
+        all_devices: List[Dict] = []
+        gateway_ips = [n["gateway"] for n in scannable_networks if n.get("gateway") and n["gateway"] != "Неизвестно"]
+
+        total_networks = len(scannable_networks)
+
+        for idx, net in enumerate(scannable_networks, start=1):
+            subnet = net["subnet"]
+            gateway = net["gateway"]
+            gateway_note = " (предположен)" if net.get("gateway_guessed") else ""
+
+            yield sse_message(
+                {
+                    "type": "log",
+                    "message": f"Сканирую подсеть {subnet}, шлюз {gateway}{gateway_note}...",
+                }
+            )
+
+            try:
+                nm.scan(hosts=subnet, arguments=NMAP_SCAN_ARGUMENTS)
+            except Exception as exc:
+                yield sse_message(
+                    {
+                        "type": "warning",
+                        "message": f"Ошибка при сканировании {subnet}: {exc}",
+                    }
+                )
+                progress = int((idx / total_networks) * 100)
+                yield sse_message(
+                    {
+                        "type": "progress",
+                        "percent": progress,
+                        "message": f"Подсеть {idx}/{total_networks} завершена с ошибкой.",
+                    }
+                )
+                continue
+
+            devices_in_subnet = []
+
+            for host in nm.all_hosts():
+                try:
+                    if nm[host].state() != "up":
+                        continue
+
+                    addresses = nm[host].get("addresses", {})
+                    mac = addresses.get("mac", "N/A")
+                    vendor_map = nm[host].get("vendor", {}) or {}
+                    vendor = vendor_map.get(mac, "Неизвестно") if mac != "N/A" else "Неизвестно"
+
+                    nmap_hostname = ""
+                    hostnames = nm[host].get("hostnames", [])
+                    if hostnames:
+                        nmap_hostname = hostnames[0].get("name", "") or ""
+
+                    hostname = resolve_hostname(host, nmap_hostname)
+                    dev_type, category = guess_device(hostname, vendor, host, gateway_ips)
+
+                    dev = {
+                        "ip": host,
+                        "hostname": hostname,
+                        "mac": mac,
+                        "vendor": vendor,
+                        "type": dev_type,
+                        "category": category,
+                        "subnet": subnet,
+                    }
+
+                    devices_in_subnet.append(dev)
+                    all_devices.append(dev)
+                except Exception:
+                    continue
 
             progress = int((idx / total_networks) * 100)
-            yield "data: {}\n\n".format(json.dumps({
-                'type': 'progress',
-                'percent': progress,
-                'message': f'✅ Подсеть {idx}/{total_networks} обработана, найдено {len(devices_in_subnet)} устройств'
-            }))
+            yield sse_message(
+                {
+                    "type": "progress",
+                    "percent": progress,
+                    "message": (
+                        f"Подсеть {idx}/{total_networks} обработана, "
+                        f"найдено устройств: {len(devices_in_subnet)}"
+                    ),
+                }
+            )
 
-        # Добавляем локальный компьютер
-        this_pc_name = socket.gethostname()
+        # Добавляем локальный компьютер, если nmap его не вернул
+        this_pc_name = socket.gethostname() or "Этот компьютер"
+
         for lip in local_ips:
-            if any(d['ip'] == lip for d in all_devices):
+            if any(d["ip"] == lip for d in all_devices):
                 continue
-            local_mac = 'N/A'
-            try:
-                for iface, addrs in psutil.net_if_addrs().items():
-                    for addr in addrs:
-                        if addr.address == lip and addr.family == psutil.AF_LINK:
-                            local_mac = addr.address
-                            break
-            except:
-                pass
-            all_devices.append({
-                'ip': lip,
-                'hostname': this_pc_name,
-                'mac': local_mac,
-                'vendor': 'Локальный компьютер',
-                'type': '💻 Этот компьютер',
-                'subnet': 'Local'
-            })
 
-        # Убираем дубли, сортируем
-        unique = {d['ip']: d for d in all_devices if d['ip'] not in ['127.0.0.1', '::1']}
-        sorted_devices = sorted(unique.values(), key=lambda x: tuple(map(int, x['ip'].split('.'))))
+            local_mac = get_mac_for_ip(lip)
+            all_devices.append(
+                {
+                    "ip": lip,
+                    "hostname": this_pc_name,
+                    "mac": local_mac,
+                    "vendor": "Локальный компьютер",
+                    "type": "💻 Этот компьютер",
+                    "category": "self",
+                    "subnet": "Local",
+                }
+            )
 
-        # Формируем заметку о правах
-        note = "Имена из DHCP + socket.gethostbyaddr."
+        # Удаляем дубли и localhost
+        unique_devices = {}
+        for dev in all_devices:
+            ip = dev.get("ip")
+            if ip in {"127.0.0.1", "::1", None, ""}:
+                continue
+            unique_devices[ip] = dev
+
+        sorted_devices = sorted(
+            unique_devices.values(),
+            key=lambda x: ipaddress.ip_address(x["ip"])
+        )
+
+        duration = round(time.time() - start_time, 1)
+
+        note_parts = [
+            "Имена устройств: nmap reverse DNS + socket.gethostbyaddr.",
+        ]
         if not admin:
-            note += " ⚠️ Запустите от имени администратора для полного сканирования (MAC-адреса и точные данные)."
+            note_parts.append(
+                "Для максимально полного сбора MAC-адресов и сетевых данных запустите терминал от имени администратора."
+            )
+        if any(net.get("gateway_guessed") for net in scannable_networks):
+            note_parts.append(
+                "Часть шлюзов определена эвристически как network+1, это может быть неточно."
+            )
 
-        yield "data: {}\n\n".format(json.dumps({
-            'type': 'result',
-            'devices': sorted_devices,
-            'networks': networks,
-            'admin': admin,
-            'note': note
-        }))
+        yield sse_message(
+            {
+                "type": "result",
+                "devices": sorted_devices,
+                "networks": scannable_networks,
+                "admin": admin,
+                "note": " ".join(note_parts),
+                "duration": duration,
+            }
+        )
 
-    return Response(generate(), mimetype='text/event-stream')
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <title>Карта локальной сети v7.2</title>
+    <title>Карта локальной сети v8.0</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <script src="https://unpkg.com/vis-network@9.1.2/standalone/umd/vis-network.min.js"></script>
     <style>
         body { background: #f8f9fa; }
-        #network-vis { height: 650px; border: 1px solid #ddd; background: white; }
-        #log-area { background: #2d2d2d; color: #0f0; font-family: monospace; height: 150px; overflow-y: scroll; padding: 10px; border-radius: 5px; font-size: 0.9rem; }
+        #network-vis { height: 650px; border: 1px solid #ddd; background: white; border-radius: 8px; }
+        #log-area {
+            background: #1e1e1e;
+            color: #8cff8c;
+            font-family: Consolas, monospace;
+            height: 180px;
+            overflow-y: auto;
+            padding: 10px;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            white-space: pre-wrap;
+        }
         .log-entry { margin: 2px 0; }
+        .small-note { font-size: 0.9rem; color: #666; }
+        .table-wrap { overflow-x: auto; }
     </style>
 </head>
-<body class="p-4">
+<body class="p-3 p-md-4">
 <div class="container">
-    <h1 class="mb-4 text-center">🗺️ Карта локальной сети v7.2 (с проверкой прав)</h1>
-    <div id="info" class="alert alert-info">Нажмите кнопку для сканирования</div>
-    <button id="scan-btn" class="btn btn-success btn-lg w-100 mb-3">🚀 СКАНИРОВАТЬ СЕТЬ</button>
+    <h1 class="mb-4 text-center">🗺️ Карта локальной сети v8.0</h1>
+
+    <div id="info" class="alert alert-info">
+        Нажмите кнопку для сканирования локальной сети
+    </div>
+
+    <button id="scan-btn" class="btn btn-success btn-lg w-100 mb-3">
+        🚀 СКАНИРОВАТЬ СЕТЬ
+    </button>
 
     <div id="progress-container" class="mb-3 d-none">
-        <div class="progress" style="height: 25px;">
-            <div id="progress-bar" class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width: 0%;">0%</div>
+        <div class="progress" style="height: 26px;">
+            <div id="progress-bar"
+                 class="progress-bar progress-bar-striped progress-bar-animated"
+                 role="progressbar"
+                 style="width: 0%;">0%</div>
         </div>
-        <div id="progress-message" class="mt-1 text-muted"></div>
+        <div id="progress-message" class="mt-2 text-muted"></div>
     </div>
 
     <div id="log-area" class="mb-3 d-none"></div>
 
-    <div id="loading" class="text-center d-none">
+    <div id="loading" class="text-center d-none mb-3">
         <div class="spinner-border text-primary"></div>
-        <p>Сканирование... (может занять до 30 сек)</p>
+        <p class="mt-2 mb-0">Сканирование выполняется...</p>
     </div>
 
-    <div id="network-vis" class="d-none"></div>
+    <div id="network-vis" class="d-none mb-4"></div>
 
-    <h4 class="mt-5 d-none" id="devices-title">Найденные устройства</h4>
-    <table class="table table-striped d-none" id="devices-table">
-        <thead><tr>
-            <th>IP</th><th>Имя</th><th>Тип</th><th>Производитель</th><th>MAC</th><th>Подсеть</th>
-        </tr></thead>
-        <tbody></tbody>
-    </table>
+    <h4 class="mt-4 d-none" id="devices-title">Найденные устройства</h4>
+    <div class="table-wrap">
+        <table class="table table-striped align-middle d-none" id="devices-table">
+            <thead>
+                <tr>
+                    <th>IP</th>
+                    <th>Имя</th>
+                    <th>Тип</th>
+                    <th>Производитель</th>
+                    <th>MAC</th>
+                    <th>Подсеть</th>
+                </tr>
+            </thead>
+            <tbody></tbody>
+        </table>
+    </div>
 </div>
 
 <script>
 let visNetwork = null;
 let eventSource = null;
 
-document.getElementById('scan-btn').addEventListener('click', async () => {
-    // Закрываем предыдущее соединение если есть
-    if (eventSource) {
-        eventSource.close();
-    }
+const els = {
+    btn: document.getElementById('scan-btn'),
+    loading: document.getElementById('loading'),
+    info: document.getElementById('info'),
+    progressContainer: document.getElementById('progress-container'),
+    progressBar: document.getElementById('progress-bar'),
+    progressMessage: document.getElementById('progress-message'),
+    logArea: document.getElementById('log-area'),
+    networkVis: document.getElementById('network-vis'),
+    devicesTitle: document.getElementById('devices-title'),
+    devicesTable: document.getElementById('devices-table')
+};
 
-    const btn = document.getElementById('scan-btn');
-    const loading = document.getElementById('loading');
-    const info = document.getElementById('info');
-    const progressContainer = document.getElementById('progress-container');
-    const progressBar = document.getElementById('progress-bar');
-    const progressMessage = document.getElementById('progress-message');
-    const logArea = document.getElementById('log-area');
-    const networkVis = document.getElementById('network-vis');
-    const devicesTitle = document.getElementById('devices-title');
-    const devicesTable = document.getElementById('devices-table');
-
-    // Скрываем предыдущие результаты
-    networkVis.classList.add('d-none');
-    devicesTitle.classList.add('d-none');
-    devicesTable.classList.add('d-none');
-    logArea.classList.remove('d-none');
-    logArea.innerHTML = '';
-
-    btn.disabled = true;
-    loading.classList.remove('d-none');
-    info.className = 'alert alert-info';
-    info.innerHTML = 'Сканирование запущено...';
-    progressContainer.classList.remove('d-none');
-    progressBar.style.width = '0%';
-    progressBar.textContent = '0%';
-    progressMessage.textContent = '';
-
-    // Подключаемся к SSE
-    eventSource = new EventSource('/api/scan/stream');
-
-    eventSource.onmessage = function(event) {
-        const data = JSON.parse(event.data);
-        console.log('SSE:', data);
-
-        switch (data.type) {
-            case 'start':
-                addLog('🚀 ' + data.message);
-                break;
-            case 'warning':
-                addLog('⚠️ ' + data.message);
-                info.className = 'alert alert-warning';
-                info.innerHTML = data.message;
-                break;
-            case 'log':
-                addLog('📌 ' + data.message);
-                break;
-            case 'progress':
-                progressBar.style.width = data.percent + '%';
-                progressBar.textContent = data.percent + '%';
-                progressMessage.textContent = data.message;
-                addLog('📊 ' + data.message);
-                break;
-            case 'result':
-                addLog('✅ Сканирование завершено!');
-                eventSource.close();
-                renderResult(data);
-                break;
-            case 'error':
-                addLog('❌ Ошибка: ' + data.message);
-                info.className = 'alert alert-danger';
-                info.innerHTML = 'Ошибка: ' + data.message.replace(/\\n/g, '<br>');
-                eventSource.close();
-                btn.disabled = false;
-                loading.classList.add('d-none');
-                progressContainer.classList.add('d-none');
-                break;
-            default:
-                addLog('ℹ️ ' + JSON.stringify(data));
-        }
-    };
-
-    eventSource.onerror = function() {
-        addLog('⚠️ Соединение потеряно или закрыто');
-    };
-});
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
+}
 
 function addLog(message) {
-    const logArea = document.getElementById('log-area');
     const entry = document.createElement('div');
     entry.className = 'log-entry';
     entry.textContent = '> ' + message;
-    logArea.appendChild(entry);
-    logArea.scrollTop = logArea.scrollHeight;
+    els.logArea.appendChild(entry);
+    els.logArea.scrollTop = els.logArea.scrollHeight;
+}
+
+function resetUIBeforeScan() {
+    if (eventSource) {
+        eventSource.close();
+        eventSource = null;
+    }
+
+    if (visNetwork) {
+        visNetwork.destroy();
+        visNetwork = null;
+    }
+
+    els.networkVis.classList.add('d-none');
+    els.devicesTitle.classList.add('d-none');
+    els.devicesTable.classList.add('d-none');
+
+    els.logArea.classList.remove('d-none');
+    els.logArea.innerHTML = '';
+
+    els.btn.disabled = true;
+    els.loading.classList.remove('d-none');
+
+    els.info.className = 'alert alert-info';
+    els.info.innerHTML = 'Сканирование запущено...';
+
+    els.progressContainer.classList.remove('d-none');
+    els.progressBar.style.width = '0%';
+    els.progressBar.textContent = '0%';
+    els.progressMessage.textContent = '';
+}
+
+function restoreUIAfterFinish() {
+    els.btn.disabled = false;
+    els.loading.classList.add('d-none');
+    els.progressContainer.classList.add('d-none');
+}
+
+function setProgress(percent, message) {
+    const p = Math.max(0, Math.min(100, Number(percent) || 0));
+    els.progressBar.style.width = p + '%';
+    els.progressBar.textContent = p + '%';
+    els.progressMessage.textContent = message || '';
+}
+
+function createCell(text, strong = false) {
+    const td = document.createElement('td');
+    if (strong) {
+        const el = document.createElement('strong');
+        el.textContent = text ?? '';
+        td.appendChild(el);
+    } else {
+        td.textContent = text ?? '';
+    }
+    return td;
 }
 
 function renderResult(data) {
-    const btn = document.getElementById('scan-btn');
-    const loading = document.getElementById('loading');
-    const info = document.getElementById('info');
-    const progressContainer = document.getElementById('progress-container');
-    const networkVis = document.getElementById('network-vis');
-    const devicesTitle = document.getElementById('devices-title');
-    const devicesTable = document.getElementById('devices-table');
+    const networks = Array.isArray(data.networks) ? data.networks : [];
+    const devices = Array.isArray(data.devices) ? data.devices : [];
+    const duration = data.duration ?? '?';
 
-    info.className = 'alert alert-success';
-    info.innerHTML = `Найдено сетей: <strong>${data.networks.length}</strong><br>` +
-                     `Устройств: <strong>${data.devices.length}</strong><br>` +
-                     `<small>${data.note || ''}</small>`;
+    els.info.className = 'alert alert-success';
+    els.info.innerHTML =
+        `Найдено сетей: <strong>${networks.length}</strong><br>` +
+        `Устройств: <strong>${devices.length}</strong><br>` +
+        `Время: <strong>${escapeHtml(duration)} сек</strong><br>` +
+        `<small>${escapeHtml(data.note || '')}</small>`;
 
-    // Строим граф
     const nodes = new vis.DataSet();
     const edges = new vis.DataSet();
 
-    // Добавляем шлюзы
-    data.networks.forEach((net, idx) => {
+    networks.forEach((net) => {
+        const gwId = 'gw_' + net.subnet;
+        const guessed = net.gateway_guessed ? ' (предположен)' : '';
         nodes.add({
-            id: 'gw_' + net.subnet,
-            label: `🔌 Шлюз\\n${net.gateway}`,
+            id: gwId,
+            label: `🔌 Шлюз\\n${net.gateway}${guessed}`,
             color: '#dc3545',
             shape: 'circle',
-            size: 35,
-            title: `Подсеть: ${net.subnet}`
+            size: 34,
+            title: `Подсеть: ${net.subnet}\\nИнтерфейс: ${net.iface || 'N/A'}`
         });
     });
 
-    // Добавляем устройства
-    data.devices.forEach(dev => {
+    devices.forEach((dev) => {
         const nodeId = dev.ip;
+        const colorByCategory = {
+            gateway: '#dc3545',
+            network: '#6f42c1',
+            printer: '#fd7e14',
+            apple: '#0dcaf0',
+            yandex: '#f59f00',
+            sber: '#6610f2',
+            tv: '#20c997',
+            computer: '#198754',
+            phone: '#0d6efd',
+            self: '#198754',
+            unknown: '#6c757d'
+        };
+
         nodes.add({
             id: nodeId,
             label: `${dev.hostname}\\n${dev.ip}`,
-            title: `Тип: ${dev.type}\\nПроизв.: ${dev.vendor}\\nMAC: ${dev.mac}\\nПодсеть: ${dev.subnet}`,
-            color: dev.type.includes('iPhone') ? '#0dcaf0' :
-                   dev.type.includes('Sber') ? '#6610f2' :
-                   dev.type.includes('Яндекс') ? '#fd7e14' :
-                   dev.type.includes('Шлюз') ? '#dc3545' : '#198754',
-            shape: 'box'
+            title:
+                `Тип: ${dev.type}\\n` +
+                `Производитель: ${dev.vendor}\\n` +
+                `MAC: ${dev.mac}\\n` +
+                `Подсеть: ${dev.subnet}`,
+            color: colorByCategory[dev.category] || '#198754',
+            shape: dev.category === 'gateway' ? 'circle' : 'box'
         });
 
         if (dev.subnet !== 'Local') {
             const gwId = 'gw_' + dev.subnet;
-            edges.add({ from: gwId, to: nodeId });
-        } else {
-            if (data.networks.length > 0) {
-                edges.add({ from: 'gw_' + data.networks[0].subnet, to: nodeId, dashes: true });
+            if (nodes.get(gwId)) {
+                edges.add({ from: gwId, to: nodeId });
             }
+        } else if (networks.length > 0) {
+            edges.add({ from: 'gw_' + networks[0].subnet, to: nodeId, dashes: true });
         }
     });
 
-    const container = document.getElementById('network-vis');
-    if (visNetwork) visNetwork.destroy();
-    visNetwork = new vis.Network(container, { nodes, edges }, { physics: { enabled: true } });
+    if (visNetwork) {
+        visNetwork.destroy();
+    }
 
-    // Заполняем таблицу
-    const tbody = devicesTable.querySelector('tbody');
+    visNetwork = new vis.Network(
+        els.networkVis,
+        { nodes, edges },
+        {
+            autoResize: true,
+            physics: {
+                enabled: true,
+                stabilization: { iterations: 200 }
+            },
+            interaction: {
+                hover: true,
+                navigationButtons: true,
+                keyboard: true
+            },
+            nodes: {
+                font: { multi: false }
+            }
+        }
+    );
+
+    const tbody = els.devicesTable.querySelector('tbody');
     tbody.innerHTML = '';
-    data.devices.forEach(dev => {
+
+    devices.forEach((dev) => {
         const row = document.createElement('tr');
-        row.innerHTML = `
-            <td>${dev.ip}</td>
-            <td><strong>${dev.hostname}</strong></td>
-            <td>${dev.type}</td>
-            <td>${dev.vendor}</td>
-            <td>${dev.mac}</td>
-            <td>${dev.subnet}</td>
-        `;
+        row.appendChild(createCell(dev.ip));
+        row.appendChild(createCell(dev.hostname, true));
+        row.appendChild(createCell(dev.type));
+        row.appendChild(createCell(dev.vendor));
+        row.appendChild(createCell(dev.mac));
+        row.appendChild(createCell(dev.subnet));
         tbody.appendChild(row);
     });
 
-    // Показываем элементы
-    networkVis.classList.remove('d-none');
-    devicesTitle.classList.remove('d-none');
-    devicesTable.classList.remove('d-none');
-    btn.disabled = false;
-    loading.classList.add('d-none');
-    progressContainer.classList.add('d-none');
+    els.networkVis.classList.remove('d-none');
+    els.devicesTitle.classList.remove('d-none');
+    els.devicesTable.classList.remove('d-none');
+
+    restoreUIAfterFinish();
 }
+
+function handleError(message) {
+    addLog('Ошибка: ' + message);
+    els.info.className = 'alert alert-danger';
+    els.info.innerHTML = 'Ошибка: ' + escapeHtml(message).replaceAll('\\n', '<br>');
+    restoreUIAfterFinish();
+    if (eventSource) {
+        eventSource.close();
+        eventSource = null;
+    }
+}
+
+els.btn.addEventListener('click', () => {
+    resetUIBeforeScan();
+    addLog('Запуск сканирования...');
+
+    eventSource = new EventSource('/api/scan/stream');
+
+    eventSource.onmessage = function(event) {
+        let data = null;
+
+        try {
+            data = JSON.parse(event.data);
+        } catch (e) {
+            addLog('Получен некорректный ответ от сервера');
+            return;
+        }
+
+        switch (data.type) {
+            case 'start':
+                addLog(data.message || 'Старт');
+                break;
+
+            case 'warning':
+                addLog('Предупреждение: ' + (data.message || ''));
+                els.info.className = 'alert alert-warning';
+                els.info.textContent = data.message || 'Предупреждение';
+                break;
+
+            case 'log':
+                addLog(data.message || '');
+                break;
+
+            case 'progress':
+                setProgress(data.percent, data.message || '');
+                addLog(data.message || '');
+                break;
+
+            case 'result':
+                addLog('Сканирование завершено');
+                if (eventSource) {
+                    eventSource.close();
+                    eventSource = null;
+                }
+                renderResult(data);
+                break;
+
+            case 'error':
+                handleError(data.message || 'Неизвестная ошибка');
+                break;
+
+            default:
+                addLog('Неизвестное сообщение: ' + JSON.stringify(data));
+        }
+    };
+
+    eventSource.onerror = function() {
+        // Если соединение уже штатно закрыли после result — просто выходим
+        if (!eventSource) {
+            return;
+        }
+
+        addLog('Соединение SSE потеряно или закрыто');
+        els.info.className = 'alert alert-warning';
+        els.info.textContent = 'Соединение с сервером было закрыто. Если результата нет — попробуйте запустить сканирование снова.';
+        restoreUIAfterFinish();
+
+        eventSource.close();
+        eventSource = null;
+    };
+});
 </script>
 </body>
 </html>
 """
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     print("🚀 Запуск сервера...")
     if not is_admin():
-        print("⚠️  ВНИМАНИЕ: Запустите PowerShell/терминал ОТ ИМЕНИ АДМИНИСТРАТОРА для полной функциональности!")
+        print("⚠️ Рекомендуется запуск от имени администратора/root для более полного сканирования.")
     else:
-        print("✅ Права администратора есть, сканирование будет работать полностью.")
-    print("Открой: http://127.0.0.1:5000")
-    app.run(debug=True, threaded=True)
+        print("✅ Повышенные права обнаружены.")
+
+    print("Откройте в браузере: http://127.0.0.1:5000")
+    app.run(host="127.0.0.1", port=5000, debug=False, threaded=True)
