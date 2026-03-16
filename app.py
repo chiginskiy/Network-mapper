@@ -20,7 +20,6 @@ def get_all_networks():
                         subnet_str = str(net)
                         if subnet_str not in seen:
                             seen.add(subnet_str)
-                            # Шлюз = .1 (самый частый случай)
                             network_obj = ipaddress.ip_network(subnet_str)
                             gw = str(network_obj.network_address + 1)
                             networks.append({
@@ -36,24 +35,28 @@ def get_all_networks():
 
 def guess_device_type(hostname: str, osmatch: str, vendor: str, ip: str) -> str:
     hn = hostname.lower()
-    vm = vendor.lower()
     om = osmatch.lower()
-    if any(x in hn for x in ['iphone', 'ipad', 'ipod']):
-        return '📱 iOS устройство'
-    if 'android' in hn or any(x in vm for x in ['samsung', 'huawei', 'xiaomi', 'oppo']):
+    vm = vendor.lower()
+
+    # Приоритет — OS-детекция
+    if 'windows' in om or 'microsoft' in om:
+        return '💻 Windows ПК'
+    if any(x in om for x in ['linux', 'ubuntu', 'debian']):
+        return '💻 Linux'
+    if 'android' in om:
         return '📱 Android устройство'
+
+    # Потом по имени и производителю
+    if any(x in hn for x in ['iphone', 'ipad', 'ipod']) or 'apple' in vm:
+        return '📱 iOS устройство'
     if any(x in hn for x in ['macbook', 'imac', 'macmini']):
         return '💻 Mac'
-    if 'windows' in om or 'microsoft' in om or any(x in hn for x in ['desktop', 'laptop', 'win']):
-        return '💻 Windows ПК'
-    if any(x in hn for x in ['printer', 'print', 'hp', 'brother', 'epson', 'canon']) or any(x in vm for x in ['hp', 'brother', 'epson']):
+    if any(x in hn for x in ['printer', 'print', 'hp', 'brother', 'epson', 'canon']) or any(x in vm for x in ['hp', 'brother', 'epson', 'canon']):
         return '🖨️ Принтер'
     if any(x in hn for x in ['tv', 'smarttv', 'lg', 'samsung tv']):
         return '📺 Смарт TV'
     if ip.endswith('.1') or 'router' in hn or 'gateway' in hn:
         return '🔌 Роутер/Шлюз'
-    if any(x in om for x in ['linux', 'ubuntu', 'debian']):
-        return '💻 Linux'
     return '❓ Неизвестное устройство'
 
 @app.route('/')
@@ -70,18 +73,19 @@ def scan():
     nm = nmap.PortScanner()
 
     for net in networks:
-        try:
-            # Сначала пытаемся с OS-детекцией
-            args = '-sn -R -O --osscan-guess -T4 --host-timeout 3s'
-            nm.scan(hosts=net['subnet'], arguments=args)
-        except Exception as e:
-            err = str(e).lower()
-            if 'root' in err or 'privilege' in err or 'sudo' in err:
-                # Fallback без OS
-                args = '-sn -R -T4 --host-timeout 3s'
+        scanned = False
+        for args in [
+            '-sn -R -O --osscan-guess --max-os-tries=2 -T4 --host-timeout 4s',   # с OS (нужны права админа)
+            '-sn -R -T4 --host-timeout 4s'                                       # fallback без OS
+        ]:
+            try:
                 nm.scan(hosts=net['subnet'], arguments=args)
-            else:
-                continue  # пропускаем проблемную подсеть
+                scanned = True
+                break
+            except:
+                continue
+        if not scanned:
+            continue
 
         for host in nm.all_hosts():
             if nm[host].state() != 'up':
@@ -89,7 +93,8 @@ def scan():
             hostname = nm[host].hostname() or 'Неизвестно'
             mac = nm[host]['addresses'].get('mac', 'N/A')
             vendor = nm[host].get('vendor', {}).get(mac, 'Неизвестно') if mac != 'N/A' else 'Неизвестно'
-            osmatch = nm[host].get('osmatch', [{}])[0].get('name', 'Неизвестно') if nm[host].get('osmatch') else 'Неизвестно'
+            osmatch_list = nm[host].get('osmatch', [])
+            osmatch = osmatch_list[0].get('name', 'Неизвестно') if osmatch_list else 'Неизвестно'
 
             dev_type = guess_device_type(hostname, osmatch, vendor, host)
 
@@ -103,24 +108,26 @@ def scan():
                 'subnet': net['subnet']
             })
 
-    # Добавляем "Этот ПК", если nmap пропустил
+    # Добавляем "Этот ПК"
     for lip in local_ips:
-        if lip not in [d['ip'] for d in all_devices]:
-            all_devices.append({
-                'ip': lip,
-                'hostname': socket.gethostname() + ' (Этот ПК)',
-                'mac': 'Local',
-                'vendor': 'Local',
-                'os': 'Ваша ОС',
-                'type': '💻 Этот компьютер',
-                'subnet': 'Local'
-            })
+        if any(d['ip'] == lip for d in all_devices):
+            continue
+        all_devices.append({
+            'ip': lip,
+            'hostname': socket.gethostname() + ' (Этот ПК)',
+            'mac': 'Local',
+            'vendor': 'Local',
+            'os': 'Ваша ОС',
+            'type': '💻 Этот компьютер',
+            'subnet': 'Local'
+        })
 
-    # Убираем дубли по IP
-    unique_devices = {d['ip']: d for d in all_devices}.values()
+    # Убираем дубли и сортируем по IP
+    unique = {d['ip']: d for d in all_devices if d['ip'] not in ['127.0.0.1', '::1']}
+    sorted_devices = sorted(unique.values(), key=lambda x: tuple(int(p) for p in x['ip'].split('.')))
 
     return jsonify({
-        'devices': list(unique_devices),
+        'devices': sorted_devices,
         'networks': networks,
         'local_ips': local_ips
     })
@@ -131,7 +138,7 @@ HTML_TEMPLATE = """
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <title>Карта локальной сети v2 — несколько подсетей + типы устройств</title>
+    <title>Карта локальной сети v3 — с правами админа</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <script src="https://unpkg.com/vis-network@9.1.2/standalone/umd/vis-network.min.js"></script>
     <style>
@@ -142,7 +149,7 @@ HTML_TEMPLATE = """
 </head>
 <body class="p-4">
 <div class="container">
-    <h1 class="mb-4 text-center">🗺️ Карта локальной сети (несколько подсетей)</h1>
+    <h1 class="mb-4 text-center">🗺️ Карта локальной сети (с OS и типами устройств)</h1>
     
     <div id="network-info" class="alert alert-info"></div>
     
@@ -152,7 +159,7 @@ HTML_TEMPLATE = """
     
     <div id="loading" class="text-center d-none">
         <div class="spinner-border text-primary"></div>
-        <p>Сканирование всех подсетей... (5–15 сек)</p>
+        <p>Сканирование... (5–12 сек с OS-детекцией)</p>
     </div>
 
     <div id="network-vis"></div>
@@ -171,7 +178,7 @@ let visNetwork;
 
 function getNodeColor(type) {
     if (type.includes('📱')) return '#0dcaf0';
-    if (type.includes('💻') || type.includes('Windows') || type.includes('Mac') || type.includes('Linux')) return '#198754';
+    if (type.includes('💻')) return '#198754';
     if (type.includes('🖨️')) return '#fd7e14';
     if (type.includes('📺')) return '#6610f2';
     if (type.includes('Этот компьютер')) return '#0d6efd';
@@ -190,7 +197,6 @@ document.getElementById('scan-btn').addEventListener('click', async () => {
 
         if (data.error) { alert('Ошибка: ' + data.error); return; }
 
-        // Информация о подсетях
         let infoHTML = `Подсетей найдено: <strong>${data.networks.length}</strong><br>`;
         data.networks.forEach(n => {
             infoHTML += `• ${n.subnet} (GW: ${n.gateway})<br>`;
@@ -198,12 +204,10 @@ document.getElementById('scan-btn').addEventListener('click', async () => {
         infoHTML += `Ваши IP: ${data.local_ips.join(', ')}`;
         document.getElementById('network-info').innerHTML = infoHTML;
 
-        // Визуализация
         const nodes = new vis.DataSet();
         const edges = new vis.DataSet();
         const routerMap = {};
 
-        // Создаём роутеры для каждой подсети
         data.networks.forEach(net => {
             const rId = 'router_' + net.subnet.replace(/[^a-z0-9]/gi, '_');
             nodes.add({
@@ -212,8 +216,7 @@ document.getElementById('scan-btn').addEventListener('click', async () => {
                 color: '#dc3545',
                 font: { size: 16, color: '#fff' },
                 shape: 'circle',
-                size: 40,
-                title: `Шлюз подсети ${net.subnet}`
+                size: 40
             });
             routerMap[net.subnet] = rId;
         });
@@ -228,18 +231,15 @@ document.getElementById('scan-btn').addEventListener('click', async () => {
             nodes.add({
                 id: nodeId,
                 label: `${dev.hostname}\\n${dev.ip}`,
-                title: `Тип: ${dev.type}\\nПроизв.: ${dev.vendor}\\nOS: ${dev.os}\\nMAC: ${dev.mac}\\nПодсеть: ${dev.subnet}`,
+                title: `Тип: ${dev.type}\\nПроизв.: ${dev.vendor}\\nOS: ${dev.os}\\nMAC: ${dev.mac}`,
                 color: color,
                 shape: 'box',
                 font: { size: 13 }
             });
 
-            // Подключаем к своему роутеру
-            let rId = routerMap[dev.subnet];
-            if (!rId && data.networks.length > 0) rId = routerMap[data.networks[0].subnet]; // fallback
+            let rId = routerMap[dev.subnet] || Object.values(routerMap)[0];
             if (rId) edges.add({ from: rId, to: nodeId, arrows: 'to' });
 
-            // Таблица
             const row = document.createElement('tr');
             row.innerHTML = `
                 <td>${dev.ip}</td>
@@ -272,5 +272,5 @@ document.getElementById('scan-btn').addEventListener('click', async () => {
 """
 
 if __name__ == '__main__':
-    print("Запуск... Откройте http://127.0.0.1:5000")
+    print("🚀 Запуск сервера...\nВАЖНО: Запустите от имени АДМИНИСТРАТОРА / sudo\nдля детекции OS и производителей!\nОткрывайте: http://127.0.0.1:5000")
     app.run(debug=True)
