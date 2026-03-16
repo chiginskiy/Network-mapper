@@ -30,8 +30,8 @@ def get_all_networks():
                         pass
     return networks, list(set(local_ips))
 
-def guess_device_type(hostname: str, vendor: str, osmatch: str) -> str:
-    """Только по данным из сети — никаких хардкодов MAC"""
+def guess_device_type(hostname: str, vendor: str, osmatch: str, ip: str) -> str:
+    """Определение типа только по реальным данным из сети"""
     hn = hostname.lower()
     vm = vendor.lower()
     om = osmatch.lower()
@@ -48,7 +48,7 @@ def guess_device_type(hostname: str, vendor: str, osmatch: str) -> str:
         return '📺 Телевизор'
     if any(x in vm for x in ['hp', 'brother', 'epson', 'canon']) or any(x in hn for x in ['print', 'printer']):
         return '🖨️ Принтер'
-    if ip.endswith('.1') or 'router' in hn or 'tp-link' in vm:
+    if ip.endswith('.1') or 'router' in hn or 'tp-link' in vm.lower():
         return '🔌 Роутер'
     if 'linux' in om:
         return '💻 Linux устройство'
@@ -69,7 +69,7 @@ def scan():
         nm = nmap.PortScanner()
 
         for net in networks:
-            # Самый надёжный режим — без зависаний
+            # Надёжный и быстрый скан без зависаний
             nm.scan(hosts=net['subnet'], arguments='-sn -R -T4 --host-timeout 3s')
 
             for host in nm.all_hosts():
@@ -80,7 +80,7 @@ def scan():
                 vendor = nm[host].get('vendor', {}).get(mac, 'Неизвестно') if mac != 'N/A' else 'Неизвестно'
                 osmatch = nm[host].get('osmatch', [{}])[0].get('name', 'Неизвестно') if nm[host].get('osmatch') else 'Неизвестно'
 
-                dev_type = guess_device_type(hostname, vendor, osmatch)
+                dev_type = guess_device_type(hostname, vendor, osmatch, host)
 
                 all_devices.append({
                     'ip': host,
@@ -92,7 +92,7 @@ def scan():
                     'subnet': net['subnet']
                 })
 
-        # Добавляем Этот ПК
+        # Добавляем Этот ПК, если его нет в списке
         for lip in local_ips:
             if any(d['ip'] == lip for d in all_devices):
                 continue
@@ -106,7 +106,7 @@ def scan():
                 'subnet': 'Local'
             })
 
-        # Убираем дубли и сортируем
+        # Убираем дубли и сортируем по IP
         unique = {d['ip']: d for d in all_devices if d['ip'] not in ['127.0.0.1', '::1']}
         sorted_devices = sorted(unique.values(), key=lambda x: tuple(int(p) for p in x['ip'].split('.')))
 
@@ -121,13 +121,13 @@ def scan():
         error_msg = str(e) + "\n\n" + traceback.format_exc()
         return jsonify({'error': error_msg}), 500
 
-# ====================== HTML + JS (с обработкой ошибок) ======================
+# ====================== HTML + JS ======================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <title>Карта локальной сети v5 — надёжная</title>
+    <title>Карта локальной сети v5.1</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <script src="https://unpkg.com/vis-network@9.1.2/standalone/umd/vis-network.min.js"></script>
     <style>
@@ -137,10 +137,10 @@ HTML_TEMPLATE = """
 </head>
 <body class="p-4">
 <div class="container">
-    <h1 class="mb-4 text-center">🗺️ Карта локальной сети v5</h1>
+    <h1 class="mb-4 text-center">🗺️ Карта локальной сети v5.1</h1>
     <div id="info" class="alert alert-info"></div>
     <button id="scan-btn" class="btn btn-success btn-lg w-100 mb-3">🚀 СКАНИРОВАТЬ СЕТЬ (одна кнопка)</button>
-    <div id="loading" class="text-center d-none"><div class="spinner-border text-primary"></div><p>Сканирование... (3–6 сек)</p></div>
+    <div id="loading" class="text-center d-none"><div class="spinner-border text-primary"></div><p>Сканирование... (3–8 сек)</p></div>
     <div id="network-vis"></div>
 
     <h4 class="mt-5">Найденные устройства</h4>
@@ -160,7 +160,7 @@ document.getElementById('scan-btn').addEventListener('click', async () => {
     btn.disabled = true;
     loading.classList.remove('d-none');
     info.className = 'alert alert-info';
-    info.innerHTML = '';
+    info.innerHTML = 'Идёт сканирование...';
 
     try {
         const res = await fetch('/api/scan');
@@ -170,12 +170,16 @@ document.getElementById('scan-btn').addEventListener('click', async () => {
         }
         const data = await res.json();
 
-        info.innerHTML = `Сеть: <strong>${data.networks[0].subnet}</strong><br>Роутер: <strong>${data.networks[0].gateway}</strong><br><small>${data.note}</small>`;
+        info.innerHTML = `Сеть: <strong>${data.networks[0]?.subnet || '—'}</strong><br>` +
+                         `Роутер: <strong>${data.networks[0]?.gateway || '—'}</strong><br>` +
+                         `<small class="text-muted">${data.note || ''}</small>`;
 
         const nodes = new vis.DataSet();
         const edges = new vis.DataSet();
         const routerId = 'router';
-        nodes.add({ id: routerId, label: `🔌 Роутер\\n${data.networks[0].gateway}`, color: '#dc3545', shape: 'circle', size: 40 });
+        if (data.networks[0]) {
+            nodes.add({ id: routerId, label: `🔌 Роутер\\n${data.networks[0].gateway}`, color: '#dc3545', shape: 'circle', size: 40 });
+        }
 
         const tbody = document.querySelector('#devices-table tbody');
         tbody.innerHTML = '';
@@ -189,7 +193,9 @@ document.getElementById('scan-btn').addEventListener('click', async () => {
                 color: dev.type.includes('iPhone') ? '#0dcaf0' : dev.type.includes('Salute') ? '#6610f2' : dev.type.includes('Яндекс') ? '#fd7e14' : '#198754',
                 shape: 'box'
             });
-            edges.add({ from: routerId, to: nodeId });
+            if (data.networks[0]) {
+                edges.add({ from: routerId, to: nodeId });
+            }
 
             const row = document.createElement('tr');
             row.innerHTML = `<td>${dev.ip}</td><td><strong>${dev.hostname}</strong></td><td>${dev.type}</td><td>${dev.vendor}</td><td>${dev.mac}</td>`;
@@ -202,7 +208,8 @@ document.getElementById('scan-btn').addEventListener('click', async () => {
 
     } catch (err) {
         info.className = 'alert alert-danger';
-        info.innerHTML = `❌ Ошибка сканирования:<br><small>${err.message}</small><br><br>Проверьте:<br>• nmap установлен и в PATH<br>• Запуск от имени администратора`;
+        info.innerHTML = `❌ Ошибка:<br><pre style="font-size:0.9em; white-space:pre-wrap;">${err.message}</pre><br>` +
+                         `Проверьте:<br>• nmap установлен и добавлен в PATH<br>• Запуск от имени администратора<br>• Python-пакет python-nmap установлен`;
     } finally {
         btn.disabled = false;
         loading.classList.add('d-none');
@@ -214,5 +221,7 @@ document.getElementById('scan-btn').addEventListener('click', async () => {
 """
 
 if __name__ == '__main__':
-    print("🚀 Запуск сервера...\nОткройте: http://127.0.0.1:5000\n(Запустите от имени администратора!)")
+    print("🚀 Запуск сервера...")
+    print("Откройте в браузере: http://127.0.0.1:5000")
+    print("ВАЖНО: запустите от имени администратора!")
     app.run(debug=True)
