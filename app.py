@@ -563,6 +563,11 @@ def scan_stream():
                     hostname = resolve_hostname(host, nmap_hostname)
                     dev_type, category = guess_device(hostname, vendor, host, gateway_ips)
 
+                    if host in local_ips:
+                        category = "self"
+                        if hostname and hostname != "Неизвестно":
+                            dev_type = "💻 Компьютер / ноутбук"
+
                     dev = {
                         "ip": host,
                         "hostname": hostname,
@@ -649,37 +654,335 @@ HTML_TEMPLATE = """
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <title>Карта локальной сети v9.1</title>
+    <title>Карта локальной сети v10.0</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <script src="https://unpkg.com/vis-network@9.1.2/standalone/umd/vis-network.min.js"></script>
     <style>
-        body { background: #f8f9fa; }
-        #network-vis { height: 650px; border: 1px solid #ddd; background: white; border-radius: 8px; }
+        :root {
+            --bg: #f5f7fb;
+            --panel: #ffffff;
+            --panel-2: #fbfcfe;
+            --text: #172033;
+            --muted: #6b7280;
+            --line: #e5e7eb;
+            --line-soft: #eef2f7;
+            --shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+
+            --primary: #2563eb;
+            --primary-soft: #dbeafe;
+
+            --success: #10b981;
+            --success-soft: #d1fae5;
+
+            --danger: #ef4444;
+            --danger-soft: #fee2e2;
+
+            --warning: #f59e0b;
+            --warning-soft: #fef3c7;
+
+            --info: #06b6d4;
+            --info-soft: #cffafe;
+
+            --violet: #8b5cf6;
+            --violet-soft: #ede9fe;
+
+            --slate: #94a3b8;
+            --slate-soft: #e2e8f0;
+
+            --radius: 18px;
+            --radius-sm: 12px;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            background:
+                radial-gradient(circle at top left, rgba(37, 99, 235, 0.06), transparent 24%),
+                radial-gradient(circle at top right, rgba(139, 92, 246, 0.06), transparent 22%),
+                var(--bg);
+            color: var(--text);
+            font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+
+        .container {
+            max-width: 1320px;
+        }
+
+        h1, h4 {
+            color: var(--text);
+            font-weight: 750;
+            letter-spacing: -0.02em;
+        }
+
+        #info {
+            border: 1px solid transparent;
+            border-radius: var(--radius);
+            box-shadow: var(--shadow);
+            background: var(--panel);
+            color: var(--text);
+            padding: 16px 18px;
+        }
+
+        .alert-info {
+            background: linear-gradient(180deg, #eff6ff 0%, #ffffff 100%);
+            border-color: #bfdbfe !important;
+        }
+
+        .alert-warning {
+            background: linear-gradient(180deg, #fff7ed 0%, #ffffff 100%);
+            border-color: #fed7aa !important;
+        }
+
+        .alert-danger {
+            background: linear-gradient(180deg, #fef2f2 0%, #ffffff 100%);
+            border-color: #fecaca !important;
+        }
+
+        .alert-success {
+            background: linear-gradient(180deg, #ecfdf5 0%, #ffffff 100%);
+            border-color: #bbf7d0 !important;
+        }
+
+        .action-row {
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            border-radius: 14px;
+            font-weight: 600;
+            padding: 11px 16px;
+            box-shadow: none !important;
+        }
+
+        .btn-lg {
+            padding: 14px 18px;
+            font-size: 1rem;
+        }
+
+        .btn-success {
+            background: linear-gradient(135deg, #16a34a 0%, #10b981 100%);
+            border: none;
+        }
+
+        .btn-outline-secondary,
+        .btn-outline-primary,
+        .btn-outline-dark {
+            background: rgba(255,255,255,0.9);
+            border-width: 1px;
+        }
+
+        .progress {
+            height: 14px !important;
+            border-radius: 999px;
+            background: #eaf0f8;
+            overflow: hidden;
+            border: 1px solid #dde6f2;
+        }
+
+        .progress-bar {
+            border-radius: 999px;
+            background: linear-gradient(90deg, #2563eb 0%, #06b6d4 100%);
+        }
+
+        #progress-message {
+            color: var(--muted);
+            font-size: 0.95rem;
+        }
+
         #log-area {
-            background: #1e1e1e;
-            color: #8cff8c;
-            font-family: Consolas, monospace;
+            background: #0f172a;
+            color: #d1fae5;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
             height: 180px;
             overflow-y: auto;
-            padding: 10px;
-            border-radius: 8px;
-            font-size: 0.9rem;
+            padding: 14px 16px;
+            border-radius: var(--radius);
+            font-size: 0.88rem;
             white-space: pre-wrap;
+            box-shadow: var(--shadow);
+            border: 1px solid rgba(255,255,255,0.04);
         }
-        .log-entry { margin: 2px 0; }
-        .table-wrap { overflow-x: auto; }
-        .action-row { gap: 8px; flex-wrap: wrap; }
-        .mono { font-family: Consolas, monospace; }
-        .small-muted { font-size: 0.9rem; color: #666; }
-        .alias-input { min-width: 180px; }
-        .comment-input { min-width: 220px; }
-        textarea#mapping-output { font-family: Consolas, monospace; min-height: 220px; }
+
+        .log-entry {
+            margin: 3px 0;
+            color: #c7f9cc;
+        }
+
+        #network-vis {
+            height: 680px;
+            border: 1px solid var(--line);
+            background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+            border-radius: 24px;
+            box-shadow: var(--shadow);
+        }
+
+        .table-wrap {
+            overflow-x: auto;
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 24px;
+            box-shadow: var(--shadow);
+            padding: 8px;
+        }
+
+        #devices-table {
+            margin-bottom: 0;
+            vertical-align: middle;
+            --bs-table-bg: transparent;
+        }
+
+        #devices-table thead th {
+            position: sticky;
+            top: 0;
+            z-index: 1;
+            background: #f8fafc;
+            color: #334155;
+            border-bottom: 1px solid var(--line);
+            font-size: 0.84rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+            padding: 16px 12px;
+            white-space: nowrap;
+        }
+
+        #devices-table tbody tr {
+            transition: background 0.15s ease, transform 0.15s ease;
+        }
+
+        #devices-table tbody tr:hover {
+            background: #f8fbff;
+        }
+
+        #devices-table td {
+            border-color: var(--line-soft);
+            padding: 14px 12px;
+            color: var(--text);
+            vertical-align: middle;
+        }
+
+        #devices-table tbody tr:last-child td {
+            border-bottom: none;
+        }
+
+        .display-name-cell {
+            font-weight: 700;
+            color: #0f172a;
+        }
+
+        .ip-cell {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            color: #334155;
+            font-size: 0.95rem;
+            white-space: nowrap;
+        }
+
+        .mac-cell {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            color: #334155;
+            white-space: nowrap;
+        }
+
+        .vendor-cell,
+        .hostname-cell {
+            color: #475569;
+        }
+
+        .badge-soft {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            border-radius: 999px;
+            padding: 7px 10px;
+            font-size: 0.85rem;
+            font-weight: 650;
+            line-height: 1.2;
+            border: 1px solid transparent;
+        }
+
+        .badge-gateway { background: var(--danger-soft); color: #b91c1c; border-color: #fecaca; }
+        .badge-network { background: #ede9fe; color: #6d28d9; border-color: #ddd6fe; }
+        .badge-printer { background: var(--warning-soft); color: #b45309; border-color: #fde68a; }
+        .badge-apple { background: var(--info-soft); color: #0f766e; border-color: #a5f3fc; }
+        .badge-yandex { background: #fff7ed; color: #c2410c; border-color: #fdba74; }
+        .badge-sber { background: #ecfccb; color: #3f6212; border-color: #bef264; }
+        .badge-tv { background: var(--violet-soft); color: #6d28d9; border-color: #ddd6fe; }
+        .badge-computer { background: var(--success-soft); color: #047857; border-color: #a7f3d0; }
+        .badge-phone { background: var(--primary-soft); color: #1d4ed8; border-color: #bfdbfe; }
+        .badge-self { background: #dcfce7; color: #166534; border-color: #bbf7d0; }
+        .badge-unknown { background: var(--slate-soft); color: #475569; border-color: #cbd5e1; }
+
+        .form-control,
+        .form-control-sm {
+            border-radius: 12px;
+            border: 1px solid #dbe2ea;
+            background: #ffffff;
+            color: var(--text);
+            min-height: 40px;
+            box-shadow: none;
+        }
+
+        .form-control:focus,
+        .form-control-sm:focus {
+            border-color: #93c5fd;
+            box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.10);
+        }
+
+        .alias-input {
+            min-width: 180px;
+            font-weight: 600;
+        }
+
+        .comment-input {
+            min-width: 200px;
+            color: #475569;
+        }
+
+        textarea#mapping-output {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            min-height: 220px;
+            background: #fbfdff;
+            border-radius: 18px;
+            border: 1px solid var(--line);
+            box-shadow: var(--shadow);
+            padding: 14px 16px;
+        }
+
+        .small-muted {
+            font-size: 0.92rem;
+            color: var(--muted);
+            margin-top: 8px;
+        }
+
+        .card-like-title {
+            margin-bottom: 14px;
+        }
+
+        @media (max-width: 768px) {
+            #network-vis {
+                height: 520px;
+                border-radius: 18px;
+            }
+
+            .table-wrap {
+                border-radius: 18px;
+                padding: 4px;
+            }
+
+            #devices-table td,
+            #devices-table th {
+                padding: 10px 8px;
+            }
+        }
     </style>
 </head>
 <body class="p-3 p-md-4">
 <div class="container">
-    <h1 class="mb-4 text-center">🗺️ Карта локальной сети v9.0</h1>
+    <h1 class="mb-4 text-center">🗺️ Карта локальной сети v10.0</h1>
 
     <div id="info" class="alert alert-info">
         Нажмите кнопку для сканирования локальной сети
@@ -693,7 +996,7 @@ HTML_TEMPLATE = """
     </div>
 
     <div id="progress-container" class="mb-3 d-none">
-        <div class="progress" style="height: 26px;">
+        <div class="progress">
             <div id="progress-bar"
                  class="progress-bar progress-bar-striped progress-bar-animated"
                  role="progressbar"
@@ -714,14 +1017,14 @@ HTML_TEMPLATE = """
     <div class="mb-4">
         <label for="mapping-output" class="form-label"><strong>Сводный mapping JSON</strong></label>
         <textarea id="mapping-output" class="form-control" placeholder="После сканирования здесь можно получить и отредактировать JSON mapping."></textarea>
-        <div class="small-muted mt-1">
-            Этот JSON можно скопировать и сохранить рядом с приложением как <span class="mono">device_aliases.json</span>.
+        <div class="small-muted">
+            Этот JSON можно скопировать и сохранить рядом с приложением как <span style="font-family: ui-monospace, monospace;">device_aliases.json</span>.
         </div>
     </div>
 
-    <h4 class="mt-4 d-none" id="devices-title">Найденные устройства</h4>
+    <h4 class="mt-4 d-none card-like-title" id="devices-title">Найденные устройства</h4>
     <div class="table-wrap">
-        <table class="table table-striped align-middle d-none" id="devices-table">
+        <table class="table align-middle d-none" id="devices-table">
             <thead>
                 <tr>
                     <th>IP</th>
@@ -821,16 +1124,18 @@ function setProgress(percent, message) {
     els.progressMessage.textContent = message || '';
 }
 
-function createCell(text, strong = false) {
+function createCell(text, className = '') {
     const td = document.createElement('td');
-    if (strong) {
-        const el = document.createElement('strong');
-        el.textContent = text ?? '';
-        td.appendChild(el);
-    } else {
-        td.textContent = text ?? '';
-    }
+    if (className) td.className = className;
+    td.textContent = text ?? '';
     return td;
+}
+
+function makeTypeBadge(type, category) {
+    const span = document.createElement('span');
+    span.className = `badge-soft badge-${category || 'unknown'}`;
+    span.textContent = type || 'Неизвестно';
+    return span;
 }
 
 function getDevicesFromTable() {
@@ -965,31 +1270,50 @@ function renderGraph(networks, devices) {
         nodes.add({
             id: netId,
             label: `🌐 ${net.subnet}\\nШлюз: ${net.gateway}${guessed}`,
-            color: '#0d6efd',
+            color: {
+                background: '#2563eb',
+                border: '#1d4ed8',
+                highlight: { background: '#3b82f6', border: '#1d4ed8' },
+                hover: { background: '#3b82f6', border: '#1d4ed8' }
+            },
             shape: 'ellipse',
-            size: 36,
-            font: { size: 18, bold: true },
+            size: 38,
+            font: {
+                color: '#ffffff',
+                size: 19,
+                face: 'Inter, Segoe UI, sans-serif',
+                bold: true
+            },
+            borderWidth: 2,
+            shadow: {
+                enabled: true,
+                color: 'rgba(37,99,235,0.25)',
+                size: 18,
+                x: 0,
+                y: 6
+            },
             title: `Подсеть: ${net.subnet}\\nИнтерфейс: ${net.iface || 'N/A'}`
         });
     });
 
     const colorByCategory = {
-        gateway: '#dc3545',
-        network: '#6f42c1',
-        printer: '#fd7e14',
-        apple: '#0dcaf0',
-        yandex: '#f59f00',
-        sber: '#6610f2',
-        tv: '#20c997',
-        computer: '#198754',
-        phone: '#0d6efd',
-        self: '#198754',
-        unknown: '#6c757d'
+        gateway: '#ef4444',
+        network: '#8b5cf6',
+        printer: '#f59e0b',
+        apple: '#06b6d4',
+        yandex: '#f97316',
+        sber: '#84cc16',
+        tv: '#8b5cf6',
+        computer: '#10b981',
+        phone: '#3b82f6',
+        self: '#059669',
+        unknown: '#94a3b8'
     };
 
     devices.forEach((dev) => {
         const nodeId = dev.ip;
         const displayName = recomputeDisplayName(dev);
+        const baseColor = colorByCategory[dev.category] || '#94a3b8';
 
         nodes.add({
             id: nodeId,
@@ -1002,8 +1326,32 @@ function renderGraph(networks, devices) {
                 `MAC: ${dev.mac || '-'}\\n` +
                 `Комментарий: ${dev.comment || '-'}\\n` +
                 `Подсеть: ${dev.subnet || '-'}`,
-            color: colorByCategory[dev.category] || '#6c757d',
-            shape: dev.category === 'gateway' ? 'circle' : 'box'
+            color: {
+                background: baseColor,
+                border: baseColor,
+                highlight: { background: baseColor, border: baseColor },
+                hover: { background: baseColor, border: baseColor }
+            },
+            shape: dev.category === 'gateway' ? 'circle' : 'box',
+            borderWidth: 1.5,
+            font: {
+                color: '#ffffff',
+                size: 17,
+                face: 'Inter, Segoe UI, sans-serif'
+            },
+            margin: {
+                top: 12,
+                bottom: 12,
+                left: 16,
+                right: 16
+            },
+            shadow: {
+                enabled: true,
+                color: 'rgba(15,23,42,0.14)',
+                size: 12,
+                x: 0,
+                y: 4
+            }
         });
 
         if (dev.subnet !== 'Local') {
@@ -1037,16 +1385,33 @@ function renderGraph(networks, devices) {
                 barnesHut: {
                     gravitationalConstant: -5000,
                     centralGravity: 0.2,
-                    springLength: 140,
+                    springLength: 145,
                     springConstant: 0.04,
                     damping: 0.09,
-                    avoidOverlap: 0.6
+                    avoidOverlap: 0.7
                 }
             },
             interaction: {
                 hover: true,
                 navigationButtons: true,
                 keyboard: true
+            },
+            edges: {
+                color: {
+                    color: '#cbd5e1',
+                    highlight: '#93c5fd',
+                    hover: '#60a5fa'
+                },
+                width: 1.5,
+                smooth: {
+                    enabled: true,
+                    type: 'dynamic'
+                }
+            },
+            nodes: {
+                shapeProperties: {
+                    borderRadius: 14
+                }
             }
         }
     );
@@ -1084,7 +1449,7 @@ function renderResult(data) {
         row.dataset.category = dev.category || '';
         row.dataset.subnet = dev.subnet || '';
 
-        row.appendChild(createCell(dev.ip));
+        row.appendChild(createCell(dev.ip, 'ip-cell'));
 
         const displayCell = document.createElement('td');
         displayCell.className = 'display-name-cell';
@@ -1111,11 +1476,15 @@ function renderResult(data) {
         commentTd.appendChild(commentInput);
         row.appendChild(commentTd);
 
-        row.appendChild(createCell(dev.hostname, false));
-        row.appendChild(createCell(dev.type, false));
-        row.appendChild(createCell(dev.vendor, false));
-        row.appendChild(createCell(dev.mac, false));
-        row.appendChild(createCell(dev.subnet, false));
+        row.appendChild(createCell(dev.hostname || '', 'hostname-cell'));
+
+        const typeTd = document.createElement('td');
+        typeTd.appendChild(makeTypeBadge(dev.type, dev.category));
+        row.appendChild(typeTd);
+
+        row.appendChild(createCell(dev.vendor || '', 'vendor-cell'));
+        row.appendChild(createCell(dev.mac || '', 'mac-cell'));
+        row.appendChild(createCell(dev.subnet || '', 'ip-cell'));
 
         tbody.appendChild(row);
     });
