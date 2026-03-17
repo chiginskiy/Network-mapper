@@ -545,8 +545,15 @@ def scan_stream():
 
                     addresses = nm[host].get("addresses", {})
                     mac = normalize_mac(addresses.get("mac", "N/A"))
+
+                    if mac == "N/A" and host in local_ips:
+                        mac = get_mac_for_ip(host)
+
                     vendor_map = nm[host].get("vendor", {}) or {}
                     vendor = vendor_map.get(mac, "Неизвестно") if mac != "N/A" else "Неизвестно"
+
+                    if host in local_ips and vendor == "Неизвестно":
+                        vendor = "Локальный компьютер"
 
                     nmap_hostname = ""
                     hostnames = nm[host].get("hostnames", [])
@@ -642,7 +649,7 @@ HTML_TEMPLATE = """
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <title>Карта локальной сети v9.0</title>
+    <title>Карта локальной сети v9.1</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <script src="https://unpkg.com/vis-network@9.1.2/standalone/umd/vis-network.min.js"></script>
@@ -1018,15 +1025,24 @@ function renderGraph(networks, devices) {
         { nodes, edges },
         {
             layout: {
-                hierarchical: {
+                improvedLayout: true
+            },
+            physics: {
+                enabled: true,
+                stabilization: {
                     enabled: true,
-                    direction: 'UD',
-                    sortMethod: 'directed',
-                    levelSeparation: 130,
-                    nodeSpacing: 170
+                    iterations: 250,
+                    updateInterval: 25
+                },
+                barnesHut: {
+                    gravitationalConstant: -5000,
+                    centralGravity: 0.2,
+                    springLength: 140,
+                    springConstant: 0.04,
+                    damping: 0.09,
+                    avoidOverlap: 0.6
                 }
             },
-            physics: false,
             interaction: {
                 hover: true,
                 navigationButtons: true,
